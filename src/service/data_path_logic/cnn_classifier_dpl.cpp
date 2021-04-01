@@ -1,5 +1,5 @@
 #include <cascade/config.h>
-#include <cascade/service_server_api.hpp>
+#include <cascade/data_path_logic_interface.hpp>
 #include <iostream>
 #include <mxnet-cpp/MxNetCpp.h>
 #include <vector>
@@ -25,14 +25,31 @@
  */
 namespace derecho{
 namespace cascade{
-void on_cascade_initialization() {
+
+#define PET_PREFIX   "/pet-model"
+#define FLOWER_PREFIX "flower-model"
+#define MY_UUID     "48e60f7c-8500-11eb-8755-0242ac110003"
+#define MY_DESC     "Demo classifier for pets and flowers."
+
+void initialize(ICascadeContext* ctxt) {
     std::cout << "[cnn_classifier example]: initialize the data path library here." << std::endl;
 }
 
-void on_cascade_exit() {
+void release(ICascadeContext* ctxt) {
     std::cout << "[cnn_classifier example]: destroy data path environment before exit." << std::endl;
 }
 
+std::unordered_set<std::string> list_prefixes() {
+    return {PET_PREFIX, FLOWER_PREFIX};
+}
+
+std::string get_uuid() {
+    return MY_UUID;
+}
+
+std::string get_description() {
+    return MY_DESC;
+}
 
 #define AT_UNKNOWN      (0)
 #define AT_PET_BREED    (1)
@@ -65,7 +82,7 @@ static StaticActionTable static_action_table;
 /*
  * The image frame data in predefined 224x224 pixel format.
  */
-class ImageFrame: public ActionData,public Blob {
+class ImageFrame: public Blob {
 public:
     std::string key;
     ImageFrame(const std::string& k, const Blob& other): Blob(other), key(k) {}
@@ -88,37 +105,24 @@ class ClassifierFilter: public CriticalDataPathObserver<CascadeType> {
                              const typename CascadeType::KeyType& key,
                              const typename CascadeType::ObjectType& value, ICascadeContext* cascade_ctxt) {
         auto* ctxt = dynamic_cast<CascadeContext<VolatileCascadeStoreWithStringKey,PersistentCascadeStoreWithStringKey>*>(cascade_ctxt);
+        if constexpr (std::is_convertible<typename CascadeType::KeyType,std::string>::value) {
+                auto* ctxt = dynamic_cast<CascadeContext<VolatileCascadeStoreWithStringKey,PersistentCascadeStoreWithStringKey>*>(cascade_ctxt);
+                size_t pos = key.rfind('/');
+                std::string prefix;
+                if (pos != std::string::npos) {
+                    prefix = key.substr(0,pos);
+                }
+                auto handlers = ctxt->get_prefix_handlers(prefix);
+                auto value_ptr = std::make_unique<ImageFrame>(value.get_key_ref(),value.blob);
+                for(auto& handler : handlers) {
+                    Action action(key,value.get_version(),handler.second,value_ptr);
+                    ctxt->post(std::move(action));
+                }
+            }
 
-        // skip non VolatileCascadeStoreWithStringKey subgroups
-        if constexpr (std::is_same<CascadeType,VolatileCascadeStoreWithStringKey>::value) {
-            // skip irrelevant subgroups and shards
-            if (sgidx != 0 || shidx !=0) {
-                return;
-            }
-            // filter by hash.
-            std::size_t hash = std::hash<typename CascadeType::KeyType>{}(key);
-            auto members = ctxt->get_service_client_ref().template get_shard_members<CascadeType>(sgidx,shidx);
-            if (members[hash % members.size()] == ctxt->get_service_client_ref().get_my_id()) {
-                Action act;
-                act.action_type = static_action_table.to_action(value.get_key_ref());
-                // act.immediate_data is not used.
-                // TODO:Can we avoid this copy?
-                act.action_data = std::make_unique<ImageFrame>(value.get_key_ref(),value.blob);
-                ctxt->post(std::move(act));
-            }
-        }
+
     }
 };
-
-template <>
-std::shared_ptr<CriticalDataPathObserver<VolatileCascadeStoreWithStringKey>> get_critical_data_path_observer<VolatileCascadeStoreWithStringKey>() {
-    return std::make_shared<ClassifierFilter<VolatileCascadeStoreWithStringKey>>();
-}
-
-template <>
-std::shared_ptr<CriticalDataPathObserver<PersistentCascadeStoreWithStringKey>> get_critical_data_path_observer<PersistentCascadeStoreWithStringKey>() {
-    return std::make_shared<ClassifierFilter<PersistentCascadeStoreWithStringKey>>();
-}
 
 #define DPL_CONF_FLOWER_SYNSET  "CASCADE/flower_synset"
 #define DPL_CONF_FLOWER_SYMBOL  "CASCADE/flower_symbol"
@@ -286,7 +290,7 @@ public:
     }
 };
 
-class ClassifierTrigger: public OffCriticalDataPathObserver {
+class PetClassifierTrigger: public OffCriticalDataPathObserver {
 private:
     // InferenceEngine flower_ie;
     // InferenceEngine pet_ie;
@@ -296,7 +300,125 @@ private:
     struct sockaddr_in serveraddr;
 #endif
 public:
-    ClassifierTrigger (): 
+    PetClassifierTrigger (): 
+        OffCriticalDataPathObserver()// ,
+        // flower_ie(derecho::getConfString(DPL_CONF_FLOWER_SYNSET),derecho::getConfString(DPL_CONF_FLOWER_SYMBOL),derecho::getConfString(DPL_CONF_FLOWER_PARAMS)),
+        // pet_ie(derecho::getConfString(DPL_CONF_PET_SYNSET),derecho::getConfString(DPL_CONF_PET_SYMBOL),derecho::getConfString(DPL_CONF_PET_PARAMS))
+        {
+#ifdef EVALUATION
+#define DPL_CONF_REPORT_TO	"CASCADE/report_to"
+            uint16_t port;
+            struct hostent *server;
+            std::string hostname;
+    		std::string report_to = derecho::getConfString(DPL_CONF_REPORT_TO);
+            hostname = report_to.substr(0,report_to.find(":"));
+            port = (uint16_t)std::stoi(report_to.substr(report_to.find(":")+1));
+            sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (sock_fd < 0) {
+                std::cerr << "Faile to open socket" << std::endl;
+                return;
+            }
+            server = gethostbyname(hostname.c_str());
+            if (server == nullptr) {
+                std::cerr << "Failed to get host:" << hostname << std::endl;
+            }
+
+            bzero((char *) &serveraddr, sizeof(serveraddr));
+            serveraddr.sin_family = AF_INET;
+            bcopy((char *)server->h_addr, 
+              (char *)&serveraddr.sin_addr.s_addr, server->h_length);
+            serveraddr.sin_port = htons(port);
+#endif
+    }
+    virtual void operator () (const std::string& key_string,
+                              persistent::version_t version,
+                              const mutils::ByteRepresentable* const value_ptr,
+                              ICascadeContext* cascade_ctxt,
+                              uint32_t worker_id) override {
+        auto* ctxt = dynamic_cast<CascadeContext<VolatileCascadeStoreWithStringKey,PersistentCascadeStoreWithStringKey>*>(cascade_ctxt);
+        /* step 1 prepare context */
+        bool use_gpu = derecho::hasCustomizedConfKey(DPL_CONF_USE_GPU)?derecho::getConfBoolean(DPL_CONF_USE_GPU):false;
+        if (use_gpu && ctxt->resource_descriptor.gpus.size()==0) {
+            dbg_default_error("Worker{}: GPU is requested but no GPU found...giving up on processing data.",worker_id);
+            return;
+        }
+        static thread_local const mxnet::cpp::Context mxnet_ctxt(
+            use_gpu? mxnet::cpp::DeviceType::kGPU : mxnet::cpp::DeviceType::kCPU,
+            use_gpu? ctxt->resource_descriptor.gpus[worker_id % ctxt->resource_descriptor.gpus.size()]:0);
+        /* create inference engines */
+        static thread_local InferenceEngine flower_ie(
+                mxnet_ctxt,
+                derecho::getConfString(DPL_CONF_FLOWER_SYNSET),
+                derecho::getConfString(DPL_CONF_FLOWER_SYMBOL),
+                derecho::getConfString(DPL_CONF_FLOWER_PARAMS));
+        static thread_local InferenceEngine pet_ie(
+                mxnet_ctxt,
+                derecho::getConfString(DPL_CONF_PET_SYNSET),
+                derecho::getConfString(DPL_CONF_PET_SYMBOL),
+                derecho::getConfString(DPL_CONF_PET_PARAMS));
+        size_t pos = key_string.rfind('/');
+        std::string prefix;
+        if (pos != std::string::npos) {
+            prefix = key_string.substr(0,pos);
+        }
+        if (prefix == PET_PREFIX) {
+            char* c;
+            mutils::to_bytes(value_ptr,c);
+            Blob b(c,mutils::bytes_size(c));
+            ImageFrame f(key_string, b);
+            ImageFrame* frame = &f;
+            std::string name;
+            double soft_max;
+#ifdef EVALUATION
+            uint64_t before_inference_ns = get_time();
+#endif
+            std::tie(name,soft_max) = pet_ie.infer(*frame);
+#ifdef EVALUATION
+            uint64_t after_inference_ns = get_time();
+#endif
+            PersistentCascadeStoreWithStringKey::ObjectType obj(frame->key,name.c_str(),name.size());
+            std::lock_guard<std::mutex> lock(p2p_send_mutex);
+#ifdef EVALUATION
+            CloseLoopReport clr;
+            FrameData* fd = reinterpret_cast<FrameData*>(frame->bytes);
+            clr.photo_id = fd->photo_id;
+            clr.inference_us = (after_inference_ns-before_inference_ns)/1000;
+#endif
+            auto result = ctxt->get_service_client_ref().template put<PersistentCascadeStoreWithStringKey>(obj);
+            for (auto& reply_future:result.get()) {
+                auto reply = reply_future.second.get();
+                dbg_default_debug("node({}) replied with version:({:x},{}us)",reply_future.first,std::get<0>(reply),std::get<1>(reply));
+#ifdef EVALUATION
+            }
+            uint64_t after_put_ns = get_time();
+            clr.put_us = (after_put_ns-after_inference_ns)/1000;
+            int serverlen = sizeof(serveraddr);
+            size_t ns = sendto(sock_fd,(void*)&clr,sizeof(clr),0,(const sockaddr*)&serveraddr,serverlen);
+            if (ns < 0) {
+                std::cerr << "Failed to report error" << std::endl;
+#endif
+            }
+        }
+    }
+
+    virtual ~PetClassifierTrigger() {
+#ifdef EVALUATION
+        close(sock_fd);
+#endif
+    }
+};
+
+class FlowerClassifierTrigger: public OffCriticalDataPathObserver {
+private:
+    // InferenceEngine flower_ie;
+    // InferenceEngine pet_ie;
+    mutable std::mutex p2p_send_mutex;
+#ifdef EVALUATION
+    int sock_fd;
+    struct sockaddr_in serveraddr;
+#endif
+public:
+    FlowerClassifierTrigger (): 
         OffCriticalDataPathObserver()// ,
         // flower_ie(derecho::getConfString(DPL_CONF_FLOWER_SYNSET),derecho::getConfString(DPL_CONF_FLOWER_SYMBOL),derecho::getConfString(DPL_CONF_FLOWER_PARAMS)),
         // pet_ie(derecho::getConfString(DPL_CONF_PET_SYNSET),derecho::getConfString(DPL_CONF_PET_SYMBOL),derecho::getConfString(DPL_CONF_PET_PARAMS))
@@ -327,7 +449,11 @@ public:
 #endif
     }
 
-    virtual void operator () (Action&& action, ICascadeContext* cascade_ctxt, uint32_t worker_id) {
+    virtual void operator () (const std::string& key_string,
+                              persistent::version_t version,
+                              const mutils::ByteRepresentable* const value_ptr,
+                              ICascadeContext* cascade_ctxt,
+                              uint32_t worker_id) override {
         auto* ctxt = dynamic_cast<CascadeContext<VolatileCascadeStoreWithStringKey,PersistentCascadeStoreWithStringKey>*>(cascade_ctxt);
         /* step 1 prepare context */
         bool use_gpu = derecho::hasCustomizedConfKey(DPL_CONF_USE_GPU)?derecho::getConfBoolean(DPL_CONF_USE_GPU):false;
@@ -349,18 +475,23 @@ public:
                 derecho::getConfString(DPL_CONF_PET_SYNSET),
                 derecho::getConfString(DPL_CONF_PET_SYMBOL),
                 derecho::getConfString(DPL_CONF_PET_PARAMS));
-        if (action.action_type == AT_FLOWER_NAME || action.action_type == AT_PET_BREED) {
-			ImageFrame* frame = dynamic_cast<ImageFrame*>(action.action_data.get());
+        size_t pos = key_string.rfind('/');
+        std::string prefix;
+        if (pos != std::string::npos) {
+            prefix = key_string.substr(0,pos);
+        }
+        if (prefix == FLOWER_PREFIX) {
+            char* c;
+            mutils::to_bytes(value_ptr,c);
+            Blob b(c,mutils::bytes_size(c));
+            ImageFrame f(key_string, b);
+            ImageFrame* frame = &f;
             std::string name;
             double soft_max;
 #ifdef EVALUATION
             uint64_t before_inference_ns = get_time();
 #endif
-            if (action.action_type == AT_FLOWER_NAME) {
-                std::tie(name,soft_max) = flower_ie.infer(*frame);
-            } else {
-                std::tie(name,soft_max) = pet_ie.infer(*frame);
-            }
+            std::tie(name,soft_max) = pet_ie.infer(*frame);
 #ifdef EVALUATION
             uint64_t after_inference_ns = get_time();
 #endif
@@ -386,20 +517,25 @@ public:
                 std::cerr << "Failed to report error" << std::endl;
 #endif
             }
-        } else {
-            std::cerr << "WARNING:" << action.action_type << " to be supported yet." << std::endl;
         }
     }
 
-    virtual ~ClassifierTrigger() {
+    virtual ~FlowerClassifierTrigger() {
 #ifdef EVALUATION
         close(sock_fd);
 #endif
     }
 };
 
-std::shared_ptr<OffCriticalDataPathObserver> get_off_critical_data_path_observer() {
-    return std::make_shared<ClassifierTrigger>();
+void register_triggers(ICascadeContext* ctxt) {
+    auto* typed_ctxt = dynamic_cast<CascadeContext<VolatileCascadeStoreWithStringKey,PersistentCascadeStoreWithStringKey>*>(ctxt);
+    typed_ctxt->register_prefixes({PET_PREFIX},MY_UUID,std::make_shared<PetClassifierTrigger>());
+    typed_ctxt->register_prefixes({FLOWER_PREFIX},MY_UUID,std::make_shared<FlowerClassifierTrigger>());
+}
+
+void unregister_triggers(ICascadeContext* ctxt) {
+    auto* typed_ctxt = dynamic_cast<CascadeContext<VolatileCascadeStoreWithStringKey,PersistentCascadeStoreWithStringKey>*>(ctxt);
+    typed_ctxt->unregister_prefixes({PET_PREFIX,FLOWER_PREFIX},MY_UUID);
 }
 
 } // namespace cascade
