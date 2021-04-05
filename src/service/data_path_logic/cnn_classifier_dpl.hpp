@@ -58,9 +58,6 @@ inline VolatileCascadeStoreWithStringKey::ObjectType get_photo_object(const char
     struct stat st;
     void* file_data;
 
-    char command[50] = "ls -la";
-    system(command);
-
     if(stat(photo_file, &st) || access(photo_file, R_OK)) {
         std::cerr << "file " << photo_file << " is not readable." << std::endl;
         return VolatileCascadeStoreWithStringKey::ObjectType::IV;

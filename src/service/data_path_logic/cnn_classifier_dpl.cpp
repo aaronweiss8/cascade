@@ -26,8 +26,8 @@
 namespace derecho{
 namespace cascade{
 
-#define PET_PREFIX   "/pet-model"
-#define FLOWER_PREFIX "flower-model"
+#define PET_PREFIX   "/pet"
+#define FLOWER_PREFIX "/flower"
 #define MY_UUID     "48e60f7c-8500-11eb-8755-0242ac110003"
 #define MY_DESC     "Demo classifier for pets and flowers."
 
@@ -266,7 +266,6 @@ public:
         // copy to input layer:
         FrameData *fd = reinterpret_cast<FrameData*>(frame.bytes);
         args_map["data"].SyncCopyFromCPU(reinterpret_cast<const mx_float*>(fd->data), input_shape.Size());
-    
         this->executor_pointer->Forward(false);
         mxnet::cpp::NDArray::WaitAll();
         // extract the result
@@ -274,9 +273,11 @@ public:
         mxnet::cpp::NDArray output_in_cpu(output_shape,mxnet::cpp::Context::cpu());
         executor_pointer->outputs[0].CopyTo(&output_in_cpu);
         mxnet::cpp::NDArray::WaitAll();
+        
         mx_float max = -1e10;
         int idx = -1;
         for(unsigned int jj = 0; jj < output_shape[1]; jj++) {
+            dbg_default_debug("BEER {} and {}", max, output_in_cpu.At(0, jj));
             if(max < output_in_cpu.At(0, jj)) {
                 max = output_in_cpu.At(0, jj);
                 idx = static_cast<int>(jj);
@@ -285,7 +286,7 @@ public:
 #ifdef EVALUATION
         // uint64_t end_ns = get_time();
 #endif
-
+        dbg_default_debug("HERERERE {} and {}", idx, max);
         return {synset_vector[idx],max};
     }
 };
@@ -346,11 +347,6 @@ public:
             use_gpu? mxnet::cpp::DeviceType::kGPU : mxnet::cpp::DeviceType::kCPU,
             use_gpu? ctxt->resource_descriptor.gpus[worker_id % ctxt->resource_descriptor.gpus.size()]:0);
         /* create inference engines */
-        static thread_local InferenceEngine flower_ie(
-                mxnet_ctxt,
-                derecho::getConfString(DPL_CONF_FLOWER_SYNSET),
-                derecho::getConfString(DPL_CONF_FLOWER_SYMBOL),
-                derecho::getConfString(DPL_CONF_FLOWER_PARAMS));
         static thread_local InferenceEngine pet_ie(
                 mxnet_ctxt,
                 derecho::getConfString(DPL_CONF_PET_SYNSET),
@@ -362,9 +358,9 @@ public:
             prefix = key_string.substr(0,pos);
         }
         if (prefix == PET_PREFIX) {
-            char* c;
-            mutils::to_bytes(value_ptr,c);
-            Blob b(c,mutils::bytes_size(c));
+            char c;
+            auto size = mutils::to_bytes(value_ptr,&c);
+            Blob b(&c,size);
             ImageFrame f(key_string, b);
             ImageFrame* frame = &f;
             std::string name;
@@ -470,20 +466,15 @@ public:
                 derecho::getConfString(DPL_CONF_FLOWER_SYNSET),
                 derecho::getConfString(DPL_CONF_FLOWER_SYMBOL),
                 derecho::getConfString(DPL_CONF_FLOWER_PARAMS));
-        static thread_local InferenceEngine pet_ie(
-                mxnet_ctxt,
-                derecho::getConfString(DPL_CONF_PET_SYNSET),
-                derecho::getConfString(DPL_CONF_PET_SYMBOL),
-                derecho::getConfString(DPL_CONF_PET_PARAMS));
         size_t pos = key_string.rfind('/');
         std::string prefix;
         if (pos != std::string::npos) {
             prefix = key_string.substr(0,pos);
         }
         if (prefix == FLOWER_PREFIX) {
-            char* c;
-            mutils::to_bytes(value_ptr,c);
-            Blob b(c,mutils::bytes_size(c));
+            char c;
+            auto size = mutils::to_bytes(value_ptr,&c);
+            Blob b(&c,size);
             ImageFrame f(key_string, b);
             ImageFrame* frame = &f;
             std::string name;
@@ -491,7 +482,7 @@ public:
 #ifdef EVALUATION
             uint64_t before_inference_ns = get_time();
 #endif
-            std::tie(name,soft_max) = pet_ie.infer(*frame);
+            std::tie(name,soft_max) = flower_ie.infer(*frame);
 #ifdef EVALUATION
             uint64_t after_inference_ns = get_time();
 #endif
